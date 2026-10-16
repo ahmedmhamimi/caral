@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: caral
+Version: 0.2.0
+Summary: Caral: a provider-agnostic terminal coding agent
+Requires-Python: >=3.10
+Requires-Dist: httpx>=0.25
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"

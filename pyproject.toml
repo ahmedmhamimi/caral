@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "caral"
+version = "0.2.0"
+description = "Caral: a provider-agnostic terminal coding agent"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.25"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+caral = "caral.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["caral*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
