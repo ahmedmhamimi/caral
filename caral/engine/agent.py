@@ -35,7 +35,7 @@ from pathlib import Path
 
 from ..domain.conversation import ensure_unique_ids, repair_conversation
 from ..domain.events import (
-    ContextCompacted, ContextPruned, ModelResponded, Notice, RetryScheduled, RunFinished,
+    AuxUsage, ContextCompacted, ContextPruned, ModelResponded, Notice, RetryScheduled, RunFinished,
     RunStarted, StepStarted, SubagentFinished, SubagentStarted, TextDelta,
 )
 from ..domain.messages import (
@@ -224,8 +224,11 @@ class Agent:
                 self.session.persisted = len(new)
             except OSError:
                 pass
-        self.bus.emit(ContextCompacted(before=before, after=len(new), method=method,
-                                       model=self.config.small_model or self.config.model))
+        model = self.config.small_model or self.config.model
+        if self.context.last_usage is not None:
+            self.bus.emit(AuxUsage(kind="compaction", model=model, usage=self.context.last_usage))
+            self.context.last_usage = None
+        self.bus.emit(ContextCompacted(before=before, after=len(new), method=method, model=model))
         return True
 
     def compact(self, focus: str | None = None) -> str:
@@ -373,7 +376,7 @@ class Agent:
         with self._lock:
             self._sub_usage.add(result.usage)
         self.bus.emit(SubagentFinished(description=description, duration_s=result.duration_s,
-                                       usage=result.usage, status=result.status))
+                                       usage=result.usage, status=result.status, model=child.model))
         if result.status == "interrupted":
             raise KeyboardInterrupt
         if result.status == "error":

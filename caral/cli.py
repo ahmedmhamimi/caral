@@ -8,6 +8,7 @@ Exit codes: 0 ok, 1 error, 2 configuration/usage error, 3 step/budget/loop limit
 - build_parser() -> argparse.ArgumentParser.
 - run_oneshot(args, config, cwd) -> int: -p mode (text, json or jsonl output).
 - run_repl(app, initial="") -> int: interactive loop (history, completion, multi-line, double Ctrl-C to exit).
+- update_prices() -> int: fetches OpenRouter's public prices into the local cache (--update-prices).
 - doctor(args) -> int: environment and configuration diagnostics (--online also checks key and model).
 - list_models_cmd(args) -> int: prints the model ids the key can use (--models).
 - read_input(app) -> str | None: one logical input (backslash continues a line); None on EOF.
@@ -27,6 +28,7 @@ from pathlib import Path
 from . import __version__
 from .adapters.store import SessionStore, format_summary, summarize_trace, trace_path
 from .app import App, build_app
+from .domain.pricing import count_models
 from .config import PERMISSION_MODES, PRESETS, config_dir, data_dir, load_config
 from .errors import CaralError, ConfigError
 
@@ -57,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--doctor", action="store_true", help="diagnose installation and configuration, then exit")
     p.add_argument("--online", action="store_true", help="with --doctor: also verify the key and model against the provider")
     p.add_argument("--models", action="store_true", help="list the models your API key can use, then exit")
+    p.add_argument("--update-prices", action="store_true", help="fetch current model prices from OpenRouter's public list, then exit")
     p.add_argument("--list-sessions", action="store_true", help="list saved sessions, then exit")
     p.add_argument("--trace", nargs="?", const="latest", metavar="ID", help="summarize a session trace, then exit")
     p.add_argument("--version", action="version", version=f"caral {__version__}")
@@ -69,6 +72,19 @@ def _overrides(args) -> dict:
         "base_url": args.base_url, "permission_mode": args.mode, "max_steps": args.max_steps,
         "token_budget": args.budget,
     }
+
+
+def update_prices() -> int:
+    from .adapters.providers import fetch_openrouter_prices
+    from .adapters.store import save_fetched
+    try:
+        fresh = fetch_openrouter_prices()
+    except CaralError as e:
+        print(f"caral: could not update prices: {e}", file=sys.stderr)
+        return 1
+    print(f"Saved {count_models(fresh)} model prices to {save_fetched(fresh)}")
+    print("Built-in and override prices still take precedence; fetched prices only fill gaps.")
+    return 0
 
 
 def doctor(args) -> int:
@@ -194,6 +210,7 @@ def run_oneshot(args, config, cwd: Path) -> int:
         print(json.dumps({
             "status": result.status, "text": result.text, "error": result.error, "steps": result.steps,
             "tool_calls": result.tool_calls, "duration_s": round(result.duration_s, 3), "usage": result.usage.to_dict(),
+            "cost_usd": round(app.meter.total_cost, 6), "unpriced_models": sorted(app.meter.unpriced),
         }, ensure_ascii=False))
     return result.exit_code
 
@@ -254,8 +271,21 @@ def run_repl(app: App, initial: str = "") -> int:
     cfg = app.config
     if isinstance(app.renderer, TerminalRenderer):
         r = app.renderer
-        r._line(r._p("bold accent", "caral") + r._p("muted", f" {__version__} · {cfg.provider}/{app.agent.model} · {app.agent.policy.mode} mode"))
+        from .adapters.ui.renderer import MODE_ROLE
+        sep = r._sep()
+        price = app.prices.lookup(app.agent.model) if app.prices is not None else None
+        if app.meter is not None and app.meter.free:
+            price_txt = r._p("money_lo", "local: free")
+        elif price is None:
+            price_txt = r._p("money_unknown", "price unknown (/prices)")
+        else:
+            price_txt = r._p("tok_in", f"${price.input:g}") + r._p("label", " in / ") + r._p("tok_out", f"${price.output:g}") + r._p("label", " out per 1M")
+        r._line(r._p("bold accent", "caral") + " " + r._p("label", __version__) + sep + r._p("cat_read", cfg.provider) + r._p("sep", "/")
+                + r._p("bold path", app.agent.model) + sep + r._p(MODE_ROLE.get(app.agent.policy.mode, "label"), f"{app.agent.policy.mode} mode")
+                + sep + price_txt)
         r.print_help_hint()
+        for problem in app.price_problems or []:
+            app.say(f"prices: {problem}", "warn")
     pending, last_interrupt = initial, 0.0
     while True:
         if pending:
@@ -296,6 +326,8 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["CARAL_ASCII"] = "1"
     if args.doctor:
         return doctor(args)
+    if args.update_prices:
+        return update_prices()
     if args.models:
         return list_models_cmd(args)
     if args.list_sessions:

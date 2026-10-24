@@ -9,6 +9,7 @@ actually filling (defaults 70% / 85%), never eagerly.
 - ContextManager(llm, config): .plan(used_tokens) -> "none" | "prune" | "compact".
   - .prune(messages, keep_recent=6) -> list[str]: shortens stale large tool results in place; returns pruned tool_use ids.
   - .compact(messages, focus=None) -> (list[dict], str): summarizes old history; returns (messages, method).
+    The tokens the summary call billed are left in .last_usage (Usage | None) so the agent can report them.
   - .emergency_drop(messages) -> list[dict]: drops oldest messages at a safe boundary with a note.
 - find_split_index(messages, keep) -> int: first safe index to keep verbatim (0 = nothing to cut).
 - SUMMARY_PROMPT / PRUNED_NOTE / DROPPED_NOTE: static text.
@@ -50,6 +51,7 @@ class ContextManager:
     def __init__(self, llm, config) -> None:
         self.llm = llm
         self.config = config
+        self.last_usage = None
 
     def plan(self, used_tokens: int) -> str:
         window = self.config.context_window
@@ -87,11 +89,16 @@ class ContextManager:
         if focus:
             prompt += f"Pay special attention to: {focus}\n\n"
         prompt += f"<session>\n{transcript}\n</session>"
+        self.last_usage = None
         try:
-            summary = self.llm.complete(
-                "You write precise technical summaries of coding sessions.", prompt,
-                max_tokens=2000, model=self.config.small_model or None,
-            ).strip()
+            system = "You write precise technical summaries of coding sessions."
+            model = self.config.small_model or None
+            with_usage = getattr(self.llm, "complete_with_usage", None)
+            if with_usage is not None:
+                summary, self.last_usage = with_usage(system, prompt, max_tokens=2000, model=model)
+            else:
+                summary = self.llm.complete(system, prompt, max_tokens=2000, model=model)
+            summary = summary.strip()
         except Exception:  # noqa: BLE001 - fall back rather than wedge the session
             summary = ""
         if not summary:

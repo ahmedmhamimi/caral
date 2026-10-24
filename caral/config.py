@@ -80,6 +80,7 @@ class Config:
     max_tokens: int = 8192
     temperature: float | None = None
     prompt_cache: bool = True
+    cache_markers: str = "auto"  # auto|on|off: explicit cache breakpoints on OpenAI-style APIs that front Claude (OpenRouter)
     max_tokens_param: str = ""
     permission_mode: str = "ask"
     context_window: int = 200_000
@@ -174,6 +175,8 @@ def load_config(cwd: Path, overrides: dict | None = None) -> Config:
 
     if cfg.kind not in ("anthropic", "openai"):
         raise ConfigError(f"Provider kind must be 'anthropic' or 'openai', got '{cfg.kind}'.")
+    if cfg.cache_markers not in ("auto", "on", "off"):
+        raise ConfigError(f"cache_markers must be 'auto', 'on' or 'off', got '{cfg.cache_markers}'.")
     if cfg.permission_mode not in PERMISSION_MODES:
         raise ConfigError(f"permission_mode must be one of {PERMISSION_MODES}, got '{cfg.permission_mode}'.")
     for name, lo, hi in (("prune_threshold", 0.1, 0.95), ("compact_threshold", 0.2, 0.98)):

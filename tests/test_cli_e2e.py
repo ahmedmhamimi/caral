@@ -272,3 +272,88 @@ def test_repl_models_command(tmp_path, capsys, server, monkeypatch):
     rc, _ = run_repl_with(monkeypatch, tmp_path, server, [], ["/models", "/model zeta", "/model", "/exit"])
     out = capsys.readouterr().out
     assert rc == 0 and "* fake" in out and "Switch with /model" in out and "model: zeta" in out
+
+
+# -- live cost -------------------------------------------------------------------------------
+PAID = ["--provider", "openai", "--model", "gpt-4.1"]      # a priced model served by the local fake server
+
+
+def test_json_output_includes_estimated_cost_for_priced_models(tmp_path, capsys, server, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    work = tmp_path / "w"
+    work.mkdir()
+    srv = server([tool_call_script("list_dir", {"depth": 1}), text_script("done")])
+    rc = main(["-p", "look", "--output-format", "json", "--mode", "yolo", *base(srv, work), *PAID])
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    # call 1: 100 fresh in, 10 out; call 2: 20 fresh + 100 cached in, 5 out  (gpt-4.1: $2 in, $0.50 cached, $8 out per 1M)
+    assert data["cost_usd"] == pytest.approx((100 * 2 + 10 * 8 + 20 * 2 + 100 * 0.5 + 5 * 8) / 1e6, abs=1e-6)
+    assert data["unpriced_models"] == []
+
+
+def test_local_runner_costs_nothing_and_unknown_models_are_reported(tmp_path, capsys, server):
+    work = tmp_path / "w"
+    work.mkdir()
+    srv = server([text_script("hi")])
+    main(["-p", "x", "--output-format", "json", *base(srv, work)])
+    free = json.loads(capsys.readouterr().out)
+    assert free["cost_usd"] == 0 and free["unpriced_models"] == []
+
+
+def test_unknown_priced_model_is_flagged_not_guessed(tmp_path, capsys, server, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    work = tmp_path / "w"
+    work.mkdir()
+    srv = server([text_script("hi")])
+    main(["-p", "x", "--output-format", "json", *base(srv, work), "--provider", "openai", "--model", "mystery-model"])
+    data = json.loads(capsys.readouterr().out)
+    assert data["cost_usd"] == 0 and data["unpriced_models"] == ["mystery-model"]
+
+
+def test_repl_shows_price_in_banner_and_spend_in_usage_and_prices_commands(tmp_path, capsys, server, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    rc, _ = run_repl_with(monkeypatch, tmp_path, server, [text_script("Hello there")],
+                          ["say hi", "/usage", "/cost", "/prices", "/prices list", "/prices gpt-4.1-mini", "/prices nope-model", "/meter off", "/meter", "/meter bogus", "/exit"],
+                          PAID)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "$2 in / $8 out per 1M" in out                                     # banner shows the model's price
+    assert "in 20 " in out and "cache 100" in out and "total $" in out        # per-call counter line
+    assert "spend since launch" in out and "(estimate from list prices)" in out and "gpt-4.1  1 call" in out
+    assert "cache read $0.5" in out and "[bundled]" in out and "claude-sonnet-5-5" in out and "gpt-4.1-mini" in out
+    assert "no price known" in out and "per-call token/cost line: off" in out and "Usage: /meter" in out
+
+
+def test_repl_local_runner_banner_and_usage_say_free(tmp_path, capsys, server, monkeypatch):
+    rc, _ = run_repl_with(monkeypatch, tmp_path, server, [text_script("hi")], ["go", "/usage", "/exit"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "local: free" in out and "local model: no API cost" in out
+
+
+def test_prices_update_command_and_flag(tmp_path, capsys, server, monkeypatch):
+    from caral.domain.pricing import ModelPrice
+    from caral.errors import ProviderError
+    price = ModelPrice(1.0, 3.0, source="openrouter")
+    fresh = {"vendor/shiny-new": price, "shiny-new": price}      # parse_openrouter_models stores both spellings
+    monkeypatch.setattr("caral.adapters.providers.fetch_openrouter_prices", lambda *a, **k: fresh)
+    assert main(["--update-prices"]) == 0
+    assert "Saved 1 model prices" in capsys.readouterr().out
+    rc, _ = run_repl_with(monkeypatch, tmp_path, server, [], ["/prices update", "/prices shiny-new", "/exit"])
+    out = capsys.readouterr().out
+    assert "Fetched 1 model prices" in out and "[fetched]" in out and "in $1" in out
+
+    def fail(*a, **k):
+        raise ProviderError("offline", kind="network", hint="Check your connection")
+    monkeypatch.setattr("caral.adapters.providers.fetch_openrouter_prices", fail)
+    assert main(["--update-prices"]) == 1
+    assert "could not update prices" in capsys.readouterr().err
+    run_repl_with(monkeypatch, tmp_path, server, [], ["/prices update", "/exit"])
+    assert "Could not update prices: offline" in capsys.readouterr().out
+
+
+def test_bad_price_file_is_reported_at_startup_without_breaking(tmp_path, capsys, server, monkeypatch):
+    from caral.adapters.store.prices import overrides_path
+    overrides_path().parent.mkdir(parents=True, exist_ok=True)
+    overrides_path().write_text(json.dumps({"broken": {"input": "x"}}))
+    rc, _ = run_repl_with(monkeypatch, tmp_path, server, [], ["/exit"])
+    assert rc == 0 and "prices: prices.json: broken" in capsys.readouterr().out

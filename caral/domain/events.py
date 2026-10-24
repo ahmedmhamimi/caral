@@ -10,7 +10,8 @@ are interchangeable subscribers. Adding a new consumer never touches the engine.
 - TodosUpdated: todo list replaced.
 - ContextPruned / ContextCompacted: context shrinking.
 - RetryScheduled: transient failure, retry pending.
-- SubagentStarted / SubagentFinished: delegated task boundaries.
+- SubagentStarted / SubagentFinished: delegated task boundaries (Finished carries the model and usage billed).
+- AuxUsage(kind, model, usage): tokens spent outside the main loop (context summaries) so cost meters see them.
 - Notice(level, message): free-form user-visible note.
 - ApprovalRequest / Approval: request/response pair for the Approver port.
 """
@@ -138,6 +139,14 @@ class SubagentFinished(Event):
     duration_s: float
     usage: Usage
     status: str
+    model: str = ""
+
+
+@dataclass(kw_only=True)
+class AuxUsage(Event):
+    kind: str  # compaction
+    model: str
+    usage: Usage
 
 
 @dataclass(kw_only=True)

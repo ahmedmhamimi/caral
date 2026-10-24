@@ -55,7 +55,9 @@ When Caral wants to edit a file or run a command it asks, and you answer with on
 | `/undo` | revert file changes from the last turn |
 | `/compact`, `/clear` | free up context, or start fresh |
 | `/models`, `/model <id>` | list models your key can use, or switch model |
-| `/usage` | tokens, cache-hit rate and context use |
+| `/usage` (`/cost`) | tokens, estimated spend, per-model breakdown, cache-hit rate, context use |
+| `/prices [list\|<model>\|update]` | show the price Caral uses for a model, list the table, or refresh it from OpenRouter |
+| `/meter on\|off` | show or hide the token/cost line printed after every model call |
 | `/trace` | summary of this session's trace |
 | `/sessions`, `/resume <id>` | list or reload saved sessions |
 | `/init` | have Caral write a `CARAL.md` for your project |
@@ -74,6 +76,54 @@ Ctrl-C interrupts a running turn. End a line with `\` to continue it on the next
 Credential files (`~/.ssh`, `.env`, cloud credentials) always ask, and destructive commands such as
 `rm -rf /` are always denied. Caral is not a sandbox: commands run on your machine with your
 permissions, so review what you approve.
+
+## Live spend and colors
+
+Every model call prints a counter line (tokens in / cached / out, that call's cost, then this prompt's
+and this launch's running total). The spinner shows the running cost while you wait, the prompt shows
+the launch total, and each run ends with a summary that includes cost. Amounts turn amber and red as
+they grow. Tool lines are colored by what they do (read, edit, run, network, subagent), tokens by kind,
+diffs green/red, headings and code in Markdown replies each get their own hue.
+
+```
+  ▸ read_file  src/background.js
+    ✓ ok · 4ms · 212 lines
+  ◆ in 1.4k │ cache 5.0k │ out 200 │ $0.0060 │ run $0.0060 · total $0.0210
+✓ 2 steps · 1 tool call · 4.2s · 1.6k tokens · $0.0060 · 78% cached · context 25%
+```
+
+- **Costs are estimates**: tokens reported by the provider times list prices. Your provider's usage
+  page is the bill. Cache reads and writes are priced separately; prompts above a model's
+  long-context threshold use its higher tier where one is known.
+- **Prices**: a built-in table (checked 2026-10-20) covers the models listed by `/prices list`. Anything
+  else shows `cost n/a` (tokens are still counted); Caral never borrows a similar model's price.
+  Add or fix entries in `~/.config/caral/prices.json` (USD per 1M tokens, cache fields optional;
+  override wins over built-in):
+
+  ```json
+  { "deepseek-chat": { "input": 0.27, "output": 1.10, "cache_read": 0.07 },
+    "my-local-gateway-model": { "input": 0, "output": 0 } }
+  ```
+
+  `caral --update-prices` (or `/prices update`) fetches OpenRouter's public list to fill gaps. OpenRouter
+  can price a model differently from the vendor's own API, so built-in and override prices take priority.
+- **OpenRouter**: if your model has no known price, Caral fetches OpenRouter's public price list once at
+  startup (4 s timeout, cached for later launches), so costs work out of the box there.
+- **Local runners** (`ollama`, `lmstudio`) are shown as free. A custom provider on localhost is not
+  assumed free (it may proxy a paid API): give its model a zero price as above.
+- `caral -p ... --output-format json` includes `cost_usd` and `unpriced_models`.
+- Colors: 256-color palette when the terminal advertises it, otherwise the 16 base colors. Force with
+  `CARAL_COLORS=basic|256`; `NO_COLOR=1` or a pipe turns color off. Every status also has a symbol and a word.
+
+## Prompt caching
+
+Anthropic's API caches automatically-marked prefixes, and so do OpenAI and DeepSeek by themselves. Claude
+models behind an OpenAI-style gateway (OpenRouter) cache only where the request marks breakpoints, so
+Caral marks the system message, the latest user message and the newest message for them. The `cache` figure
+in the counter line should climb from the second call on; if it stays at 0, caching is not happening.
+Settings in `~/.config/caral/config.json`: `"cache_markers": "auto"` (default: Claude on OpenRouter) | `"on"`
+(any gateway that fronts Claude, e.g. a LiteLLM proxy) | `"off"`; `"prompt_cache": false` disables all of it.
+If a server rejects the markers, Caral steps down (fewer breakpoints, then none) and remembers for the session.
 
 ## Configuration
 

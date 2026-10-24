@@ -1,7 +1,7 @@
 # Audit report
 
 Method: reproduce first, fix second, lock with a test. Every item below has a regression test.
-The suite is 326 tests (~12 s): unit, property-style (chunking invariance), end-to-end against a
+The suite is 394 tests (~19 s): unit, property-style (chunking invariance), end-to-end against a
 fake HTTP server, real-terminal (pty) checks, and architecture-fitness tests.
 
 ## A. Defects found in the previous version (all fixed)
@@ -66,3 +66,13 @@ overflow a real 30k window and fail. Real-world savings depend on the model's re
 - Windows paths are written but untested. Token counts are estimates (self-calibrating).
 - Streaming Markdown does not render tables, links or word-wrap; ripgrep is optional.
 - Not implemented: MCP, hooks, image input, extended thinking, OS sandbox.
+- **Spend figures are estimates.** Provider-reported tokens times list prices (bundled table checked
+  2026-10-20, user overrides, optional OpenRouter fill-in). No batch/off-peak/volume discounts, subagent
+  usage ignores long-context tiers, a resumed session's earlier spend is not counted, and the pricing,
+  cache-rate and cost-line behavior has only been tested against mocked servers, not live billing.
+  Models without a known price show `cost n/a` instead of a guess.
+- **OpenRouter cache markers are unverified against the live service.** Fixed after a user report that
+  `cache` stayed 0 on every call (the OpenAI-compatible adapter sent no breakpoints for Claude models).
+  The request shape follows OpenRouter's documented `cache_control` content parts and is tested against
+  mocks only; whether tool-result messages honor a breakpoint is unconfirmed, which is why the latest user
+  message is marked too. Check the `cache` counter after the second call.

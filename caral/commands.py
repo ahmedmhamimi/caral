@@ -5,7 +5,9 @@ Slash commands as a registry (add a command = register one function; nothing els
 - CommandRegistry: .register(cmd), .get(name), .names() -> list[str], .dispatch(line, app) -> bool,
   .suggest(name) -> list[str] (typo help), .help_text() -> str (grouped).
 - build_registry() -> CommandRegistry: the built-in commands (help, exit, clear, compact, undo, mode,
-  model, models, todos, usage, sessions, resume, tools, config, trace, expand, init).
+  model, models, todos, usage, prices, meter, sessions, resume, tools, config, trace, expand, init).
+  /usage shows tokens, estimated spend and a per-model breakdown; /prices shows, lists or refreshes the
+  price table; /meter toggles the per-call counter line.
 - INIT_PROMPT: prompt behind /init.
 """
 
@@ -18,6 +20,7 @@ from typing import Callable
 
 from .adapters.store.trace import format_summary, summarize_trace, trace_path
 from .config import PERMISSION_MODES
+from .domain.pricing import count_models, format_money
 from .domain.textutil import human_tokens
 
 INIT_PROMPT = (
@@ -139,12 +142,98 @@ def _todos(app, _a):
 def _usage(app, _a):
     u = app.agent.session.usage
     used, window = app.agent.context_usage()
+    p = app.paint
     app.say(
-        f"session: {human_tokens(u.billable)} billable tokens ({human_tokens(u.input_tokens)} fresh in, "
-        f"{human_tokens(u.cache_write)} cache writes, {human_tokens(u.output_tokens)} out) · "
-        f"{human_tokens(u.cache_read)} cached reads ({u.cache_hit_ratio:.0%} hit)\n"
-        f"context: {human_tokens(used)} / {human_tokens(window)} ({used / window:.0%})"
+        f"{p('label', 'session:')} {p('tok_in', human_tokens(u.billable))} billable tokens "
+        f"({p('tok_in', human_tokens(u.input_tokens))} fresh in, {p('tok_in', human_tokens(u.cache_write))} cache writes, "
+        f"{p('tok_out', human_tokens(u.output_tokens))} out) · {p('tok_cache', human_tokens(u.cache_read))} cached reads "
+        f"({p('tok_cache', f'{u.cache_hit_ratio:.0%}')} hit)\n"
+        f"{p('label', 'context:')} {human_tokens(used)} / {human_tokens(window)} ({used / window:.0%})"
     )
+    m = app.meter
+    if m is None or not m.total_usage.context_tokens + m.total_usage.output_tokens:
+        return
+    if m.free:
+        app.say(f"{p('label', 'spend')} {p('money_lo', 'local model: no API cost')}")
+        return
+    partial = bool(m.unpriced)
+    app.say(
+        f"{p('label', 'spend since launch')} {p(app.paint_money_role(m.total_cost), format_money(m.total_cost) + ('+' if partial else ''))}"
+        f" (estimate from list prices) · {p('label', 'last prompt')} {format_money(m.run_cost)}"
+    )
+    for model, t in sorted(m.by_model().items(), key=lambda kv: -kv[1].cost):
+        cost = p("money_unknown", "no price") if not t.priced and t.cost == 0 else format_money(t.cost) + ("+" if not t.priced else "")
+        app.say(
+            f"  {p('bold', model)}  {t.calls} call{'s' if t.calls != 1 else ''} · in {human_tokens(t.usage.input_tokens + t.usage.cache_write)}"
+            f" · cache {human_tokens(t.usage.cache_read)} · out {human_tokens(t.usage.output_tokens)} · {cost}"
+        )
+    if partial:
+        app.say(p("money_unknown", "  + = some models have no known price (see /prices)"))
+
+
+def _price_row(app, model: str) -> str:
+    p = app.paint
+    price = app.prices.lookup(model)
+    if price is None:
+        return f"  {p('bold', model)}  {p('money_unknown', 'no price known')} {p('label', '(add one in ~/.config/caral/prices.json, or /prices update)')}"
+    r = price
+    cache = f"cache read ${r.cache_read_rate:g} / write ${r.cache_write_rate:g}"
+    origin = app.prices.layer_of(model)
+    out = (f"  {p('bold', model)}  in {p('tok_in', f'${r.input:g}')} · out {p('tok_out', f'${r.output:g}')} · "
+           f"{p('tok_cache', cache)} per 1M tokens {p('label', f'[{origin}]')}")
+    if r.note:
+        out += "\n    " + p("label", r.note)
+    return out
+
+
+def _prices(app, a):
+    from .adapters.providers import fetch_openrouter_prices
+    from .adapters.store import fetched_age_days, overrides_path, save_fetched
+    from .domain.pricing import BUNDLED_AS_OF
+    from .errors import CaralError
+    if app.prices is None:
+        app.say("No price book loaded.", "error")
+        return
+    arg = a.strip()
+    if arg == "update":
+        try:
+            fresh = fetch_openrouter_prices()
+        except CaralError as e:
+            app.say(f"Could not update prices: {e}" + (f"\n  {e.hint}" if getattr(e, "hint", "") else ""), "error")
+            return
+        path = save_fetched(fresh)
+        app.prices.fetched = fresh
+        app.say(f"Fetched {count_models(fresh)} model prices from OpenRouter ({path}). Built-in and override prices still win; "
+                "these fill gaps. OpenRouter prices can differ from a vendor's direct API.")
+        return
+    if arg == "list":
+        for k in app.prices.known():
+            price = app.prices.lookup(k)
+            app.say(f"  {k:<34} in ${price.input:g} · out ${price.output:g}  [{app.prices.layer_of(k)}]")
+        return
+    if arg:
+        app.say(_price_row(app, arg))
+        return
+    models = [app.config.model] + ([app.config.small_model] if app.config.small_model else [])
+    for mdl in models:
+        app.say(_price_row(app, mdl))
+    age = fetched_age_days()
+    app.say(app.paint("label", f"  built-in table checked {BUNDLED_AS_OF} · {len(app.prices.known())} models known · "
+                      f"overrides: {overrides_path()}" + (f" · fetched cache {age:.0f}d old" if age is not None else "")))
+    app.say(app.paint("label", "  /prices list · /prices <model> · /prices update (fetch OpenRouter's public list)"))
+
+
+def _meter(app, a):
+    r = app.renderer
+    if not hasattr(r, "step_meter"):
+        app.say("The per-call meter is only available in the interactive terminal.")
+        return
+    if a in ("on", "off"):
+        r.step_meter = a == "on"
+    elif a:
+        app.say("Usage: /meter [on|off]", "error")
+        return
+    app.say(f"per-call token/cost line: {'on' if r.step_meter else 'off'}  (the prompt, spinner and run summary always show spend)")
 
 
 def _sessions(app, _a):
@@ -222,7 +311,9 @@ def build_registry() -> CommandRegistry:
         SlashCommand("model", "show or switch the model", _model, "inspect"),
         SlashCommand("models", "list models your key can use", _models, "inspect"),
         SlashCommand("todos", "show the todo list", _todos, "inspect"),
-        SlashCommand("usage", "tokens, cache hits and context use", _usage, "inspect"),
+        SlashCommand("usage", "tokens, spend and context use", _usage, "inspect", ("cost",)),
+        SlashCommand("prices", "show, list or refresh model prices [list|<model>|update]", _prices, "inspect"),
+        SlashCommand("meter", "per-call token/cost line on|off", _meter, "inspect"),
         SlashCommand("trace", "summarize this session's trace", _trace, "inspect"),
         SlashCommand("expand", "show the last tool output in full", _expand, "inspect"),
         SlashCommand("tools", "list available tools", _tools, "inspect"),

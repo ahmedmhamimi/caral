@@ -5,6 +5,7 @@ parser. Concrete providers only translate wire formats.
 - Provider: abstract base implementing the LLM port.
   - .stream(system, messages, tools, on_text=None, on_retry=None, model=None, max_tokens=None) -> Turn.
   - .complete(system, prompt, max_tokens=2048, model=None) -> str: tool-less single-shot completion.
+  - .complete_with_usage(system, prompt, max_tokens=2048, model=None) -> (str, Usage): same, plus tokens billed.
   - .list_models() -> list[str]: model ids the key can use; .models_url() -> str.
   - .close() -> None.
 - make_client() -> httpx.Client: streaming-friendly timeouts, no env proxies surprises.
@@ -25,7 +26,7 @@ from typing import Callable, Iterator
 
 import httpx
 
-from ...domain.messages import Turn, user_text
+from ...domain.messages import Turn, Usage, user_text
 from ...errors import ProviderError, classify_http_error
 
 
@@ -126,8 +127,13 @@ class Provider(ABC):
     ) -> Turn:
         """Run one model call, streaming text to on_text, and return the finished Turn."""
 
+    def complete_with_usage(self, system: str, prompt: str, max_tokens: int = 2048,
+                            model: str | None = None) -> tuple[str, Usage]:
+        turn = self.stream(system, [user_text(prompt)], [], model=model, max_tokens=max_tokens)
+        return turn.text, turn.usage
+
     def complete(self, system: str, prompt: str, max_tokens: int = 2048, model: str | None = None) -> str:
-        return self.stream(system, [user_text(prompt)], [], model=model, max_tokens=max_tokens).text
+        return self.complete_with_usage(system, prompt, max_tokens, model)[0]
 
     def models_url(self) -> str:
         return self.cfg.base_url.rstrip("/") + "/models"

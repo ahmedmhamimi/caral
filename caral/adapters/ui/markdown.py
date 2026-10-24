@@ -1,7 +1,8 @@
 """
 Streaming Markdown renderer for terminals. Consumes text deltas as they arrive and renders
 immediately (no waiting for a full line or paragraph), handling headings, bullets, quotes,
-fenced code blocks (with a gutter, never styled inline), **bold** and `code`. Inline state resets
+fenced code blocks (with a colored gutter, never styled inline), **bold** and `code`. Headings, bullets,
+quotes, code and fences each get their own hue. Inline state resets
 at every newline so an unbalanced marker can never bleed into later output. Without color it is a
 transparent pass-through (Markdown source is already readable as plain text).
 
@@ -118,21 +119,21 @@ class StreamingMarkdown:
                 return  # still reading the #'s
             if hashes <= 6 and s[hashes] == " ":
                 self.mode = "heading"
-                self._out(self.t.sgr("bold accent") + indent + s[hashes + 1 :])
+                self._out(self.t.sgr("heading") + indent + s[hashes + 1 :])
                 return
         elif c in "-*+":
             if len(s) == 1:
                 return
             if s[1] == " ":
                 self.mode = "normal"
-                self._out(indent + self.t.paint("accent", self.t.g("bullet")) + " ")
+                self._out(indent + self.t.paint("bullet", self.t.g("bullet")) + " ")
                 self._buf = ""
                 self._inline_text(s[2:])
                 return
         elif c == ">":
             self.mode = "quote"
             self._skip_space = True
-            self._out(self.t.sgr("muted") + self.t.g("bar") + " ")
+            self._out(self.t.sgr("quote") + self.t.g("bar") + " ")
             self._buf = ""
             rest = s[1:]
             if rest.startswith(" "):
@@ -151,7 +152,7 @@ class StreamingMarkdown:
 
     def _start_code(self) -> None:
         buf, self._buf, self.mode = self._buf, "", "code"
-        self._out(self.t.paint("muted", "  " + self.t.g("bar") + " ") + self.t.sgr("code") + buf)
+        self._out(self.t.paint("hunk", "  " + self.t.g("bar") + " ") + self.t.sgr("code") + buf)
 
     def _inline(self, ch: str) -> None:
         if self.code:
@@ -186,11 +187,11 @@ class StreamingMarkdown:
         if m == "fence_open":
             self.in_fence = True
             lang = self._lang.strip()
-            self._out(self.t.paint("muted", "  " + self.t.g("open") + (f" {lang}" if lang else "")))
+            self._out(self.t.paint("hunk", "  " + self.t.g("open")) + (self.t.paint("accent", f" {lang}") if lang else ""))
         elif m == "fence_close":
             self.in_fence = False
-            self._out(self.t.paint("muted", "  " + self.t.g("close")))
+            self._out(self.t.paint("hunk", "  " + self.t.g("close")))
         elif m == "start" and self.in_fence:
-            self._out(self.t.paint("muted", "  " + self.t.g("bar")))
+            self._out(self.t.paint("hunk", "  " + self.t.g("bar")))
         self._out(self.t.RESET + "\n")
         self._reset_line()

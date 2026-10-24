@@ -27,11 +27,11 @@ checked and repaired (`domain/conversation.py`) so a crash can never wedge a ses
 ```
 cli.py / app.py / commands.py      composition root + shell (may import anything)
         |
-adapters/  providers  tools  store  ui     concrete I/O; siblings never import each other
+adapters/  providers(+price_fetch)  tools  store(+prices)  ui     concrete I/O; siblings never import each other
         |
-engine/    agent  executor  permissions  context  loopguard  bus  prompt
+engine/    agent  executor  permissions  context  loopguard  bus  prompt  meter
         |
-domain/    messages  events  tools(contract)  conversation  shellsafety  tokens  redact ...
+domain/    messages  events  pricing  tools(contract)  conversation  shellsafety  tokens  redact ...
 errors.py  config.py                        leaves
 ```
 
@@ -63,7 +63,9 @@ Sessions are append-only JSONL, so the exact conversation is reproducible.
 ## Cost architecture
 
 1. **Prompt-cache stability** - system prompt built once per session, tool schemas cached and ordered,
-   cache breakpoints on system/tools/newest message (3 of the 4 allowed).
+   cache breakpoints on system/tools/newest message (3 of the 4 allowed). Claude behind OpenRouter gets
+   equivalent breakpoints (system, latest user message, newest message) on the OpenAI-style wire, with
+   step-down fallback if the gateway rejects them.
 2. **Read dedupe** - re-reading an unchanged range already in context returns a one-line notice.
 3. **Right-sized output** - tool output cap 16k chars, read cap 40k chars/1000 lines, grep 100 lines,
    edits return a one-line result (the diff is UI-only and never re-sent to the model).
@@ -74,6 +76,18 @@ Sessions are append-only JSONL, so the exact conversation is reproducible.
    one automatic recovery from context-length errors, no retry of auth/bad-request errors.
 7. **Self-calibrating token estimates** - chars/token adapts to real provider usage.
 8. **Web fetch cache** - 15-minute per-session cache.
+
+## Spend metering
+
+`domain/pricing` is pure data and arithmetic (price table, layered lookup, cost of a `Usage`).
+`engine/meter.CostMeter` is just another bus subscriber: it prices every `ModelResponded`,
+`SubagentFinished` (carries the model) and `AuxUsage` (context summaries) event, so the agent never
+knows about money. The app subscribes it before any renderer, so UIs always read current totals.
+Price files (overrides, fetched cache) live in `adapters/store/prices`; the OpenRouter fetch lives in
+`adapters/providers/price_fetch`. Lookup is exact-id only: an unknown model is reported as unpriced
+instead of inheriting a sibling's rate. Known approximations: list prices only (no discounts, batch or
+off-peak rates), subagent usage is priced at base rates (no long-context tier), and a resumed session's
+earlier spend is not included (the meter counts since launch).
 
 ## What is deliberately not here (yet)
 

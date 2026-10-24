@@ -275,3 +275,119 @@ def test_list_models_errors_are_typed():
 def test_model_not_found_hint_mentions_the_models_command():
     e = classify_http_error(404, "The model `x` does not exist or you do not have access to it.")
     assert e.kind == "not_found" and "caral --models" in e.hint
+
+
+# -- prompt-cache markers for Claude behind OpenAI-style gateways (OpenRouter) ---------------
+from caral.adapters.providers.openai_compat import add_cache_markers, wants_cache_markers
+
+CLAUDE = "anthropic/claude-sonnet-4.5"
+OR_URL = "https://openrouter.ai/api/v1"
+
+
+def _history():
+    return [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "first prompt"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "result one"},
+        {"role": "user", "content": "second prompt"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c2", "content": "result two"},
+    ]
+
+
+def _marked(msgs):
+    return [i for i, m in enumerate(msgs) if isinstance(m["content"], list) and any("cache_control" in p for p in m["content"])]
+
+
+def test_cache_markers_land_on_system_latest_user_and_newest_message():
+    h = _history()
+    out = add_cache_markers(h)
+    assert _marked(out) == [0, 4, 6]
+    assert out[0]["content"] == [{"type": "text", "text": "SYS", "cache_control": {"type": "ephemeral"}}]
+    assert out[6]["content"][0]["text"] == "result two" and out[6]["tool_call_id"] == "c2"
+    assert _marked(add_cache_markers(h, "basic")) == [0, 4]          # no newest-message breakpoint
+    assert _marked(h) == [] and h[0]["content"] == "SYS"             # input never mutated
+
+
+def test_cache_markers_skip_empty_content_and_survive_odd_histories():
+    assert add_cache_markers([]) == []
+    out = add_cache_markers([{"role": "user", "content": ""}, {"role": "assistant", "content": None, "tool_calls": []}])
+    assert _marked(out) == []                                        # empty text blocks are invalid for caching
+    out = add_cache_markers([{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}])
+    assert out[0]["content"][0] == {"type": "text", "text": "a"} and out[0]["content"][1]["cache_control"] == {"type": "ephemeral"}
+
+
+@pytest.mark.parametrize("base,model,extra,expected", [
+    (OR_URL, CLAUDE, {}, True),
+    (OR_URL, "openai/gpt-4.1", {}, False),                           # other models cache automatically
+    (OR_URL, "deepseek/deepseek-v4.1-flash", {}, False),
+    ("https://api.openai.com/v1", "gpt-4.1", {}, False),
+    ("https://api.deepseek.com/v1", "deepseek-chat", {}, False),
+    (OR_URL, "some/claude-variant", {}, True),
+    ("https://gateway.example/v1", "claude-sonnet-5-5", {}, False),  # unknown gateway: not assumed
+    ("https://gateway.example/v1", "claude-sonnet-5-5", {"cache_markers": "on"}, True),
+    (OR_URL, CLAUDE, {"cache_markers": "off"}, False),
+    (OR_URL, CLAUDE, {"prompt_cache": False}, False),
+    (OR_URL, CLAUDE, {"cache_markers": "on", "prompt_cache": False}, False),
+])
+def test_wants_cache_markers(base, model, extra, expected):
+    assert wants_cache_markers(Config(provider="x", kind="openai", model=model, base_url=base, **extra), model) is expected
+
+
+def _ok_stream(usage=None):
+    return httpx.Response(200, content=sse(
+        {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]},
+        {"choices": [], "usage": usage or {"prompt_tokens": 10, "completion_tokens": 1}}, "[DONE]"))
+
+
+def test_openrouter_claude_request_carries_markers_and_other_models_do_not():
+    bodies = []
+
+    def handler(req):
+        bodies.append(json.loads(req.content))
+        return _ok_stream()
+    p = provider(OpenAIProvider, handler, base_url=OR_URL)
+    msgs = [user_text("hi")]
+    p.stream("SYS", msgs, TOOL, model=CLAUDE)
+    p.stream("SYS", msgs, TOOL, model="openai/gpt-4.1")
+    assert _marked(bodies[0]["messages"]) == [0, 1] and bodies[0]["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert _marked(bodies[1]["messages"]) == [] and bodies[1]["messages"][0]["content"] == "SYS"
+    assert "cache_control" not in json.dumps(bodies[0]["tools"])      # tools stay plain function schemas
+
+
+def test_markers_step_down_when_the_server_rejects_them_and_it_is_remembered():
+    seen = []
+
+    def handler(req):
+        body = json.loads(req.content)
+        seen.append("cache_control" in req.content.decode())
+        if "cache_control" in req.content.decode():
+            return httpx.Response(400, json={"error": {"message": "cache_control is not supported on this content"}})
+        return _ok_stream()
+    p = provider(OpenAIProvider, handler, base_url=OR_URL)
+    turn = p.stream("SYS", [user_text("hi"), assistant_message([tool_use_block("c", "x", {})]), user_blocks([tool_result_block("c", "r")])], TOOL, model=CLAUDE)
+    assert turn.text == "ok" and seen == [True, True, False] and p._cache_mode == "off"
+    p.stream("SYS", [user_text("again")], TOOL, model=CLAUDE)
+    assert seen == [True, True, False, False]                          # no more attempts with markers
+
+
+def test_unrelated_400_is_not_blamed_on_the_markers():
+    p = provider(OpenAIProvider, lambda req: httpx.Response(400, json={"error": {"message": "model not found"}}), base_url=OR_URL)
+    with pytest.raises(ProviderError):
+        p.stream("SYS", [user_text("hi")], TOOL, model=CLAUDE)
+    assert p._cache_mode == "full"
+
+
+def test_openrouter_cache_write_tokens_are_split_out_of_fresh_input():
+    u = parse_usage({"prompt_tokens": 3000, "completion_tokens": 20,
+                     "prompt_tokens_details": {"cached_tokens": 2000, "cache_write_tokens": 600}})
+    assert (u.input_tokens, u.cache_read, u.cache_write, u.output_tokens) == (400, 2000, 600, 20) and u.context_tokens == 3000
+
+
+def test_cache_markers_setting_is_validated(tmp_path):
+    from caral.config import load_config
+    from caral.errors import ConfigError
+    with pytest.raises(ConfigError, match="cache_markers"):
+        load_config(tmp_path, {"provider": "ollama", "cache_markers": "sometimes"})
+    assert load_config(tmp_path, {"provider": "ollama", "cache_markers": "off"}).cache_markers == "off"

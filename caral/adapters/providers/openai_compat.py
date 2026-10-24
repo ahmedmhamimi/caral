@@ -3,17 +3,28 @@ OpenAI-compatible chat-completions adapter (OpenAI, OpenRouter, Groq, DeepSeek, 
 LM Studio, vLLM, ...). Adapts to server quirks at runtime: drops stream_options or swaps the
 max-token parameter name when a server rejects them.
 
+Prompt caching: OpenAI and DeepSeek cache prefixes automatically, but Claude models behind an
+OpenAI-style gateway (OpenRouter) only cache where the request marks breakpoints. For those the
+adapter marks the system message, the latest user message (a stable anchor) and the newest message
+(so tool results inside a long run are cached too). If a server rejects the markers the adapter
+steps down (all -> system+user only -> none) and remembers it for the session.
+
 - OpenAIProvider: Provider for /chat/completions.
   - .stream(...) -> Turn; ._payload(...) -> dict; ._headers() -> dict.
 - convert_messages(system, messages) -> list[dict]: internal blocks -> OpenAI chat messages.
 - convert_tools(tools) -> list[dict]: internal schemas -> OpenAI function tools.
-- parse_usage(u) -> Usage: normalizes OpenAI/DeepSeek usage (cached tokens split out).
+- wants_cache_markers(cfg, model) -> bool: True for Claude models on OpenRouter (cache_markers="auto"),
+  always with "on", never with "off" or prompt_cache=False.
+- add_cache_markers(messages, mode="full") -> list[dict]: copy of converted messages with
+  {"type": "ephemeral"} cache_control on text parts; mode "basic" skips the newest-message breakpoint.
+- parse_usage(u) -> Usage: normalizes OpenAI/DeepSeek/OpenRouter usage (cache reads and writes split out).
 """
 
 from __future__ import annotations
 
 import json
 from typing import Callable
+from urllib.parse import urlparse
 
 from ...domain.messages import Turn, Usage
 from ...errors import ProviderError
@@ -27,6 +38,44 @@ def convert_tools(tools: list[dict]) -> list[dict]:
         {"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}}
         for t in tools
     ]
+
+
+CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def wants_cache_markers(cfg, model: str) -> bool:
+    mode = (getattr(cfg, "cache_markers", "auto") or "auto").lower()
+    if mode == "off" or not getattr(cfg, "prompt_cache", True):
+        return False
+    if mode == "on":
+        return True
+    host = (urlparse(cfg.base_url or "").hostname or "").lower()
+    m = (model or "").lower()
+    return host.endswith("openrouter.ai") and (m.startswith("anthropic/") or "claude" in m)
+
+
+def _mark(msg: dict) -> None:
+    c = msg.get("content")
+    if isinstance(c, str) and c:
+        msg["content"] = [{"type": "text", "text": c, "cache_control": dict(CACHE_CONTROL)}]
+    elif isinstance(c, list) and c and isinstance(c[-1], dict) and c[-1].get("type") == "text" and c[-1].get("text"):
+        msg["content"] = c[:-1] + [{**c[-1], "cache_control": dict(CACHE_CONTROL)}]
+
+
+def add_cache_markers(messages: list[dict], mode: str = "full") -> list[dict]:
+    """Breakpoints (at most 3 of the 4 Anthropic allows): system, latest user message, newest message."""
+    msgs = [dict(m) for m in messages]
+    targets: set[int] = set()
+    if msgs and msgs[0].get("role") == "system":
+        targets.add(0)
+    users = [i for i, m in enumerate(msgs) if m.get("role") == "user"]
+    if users:
+        targets.add(users[-1])
+    if mode == "full" and msgs:
+        targets.add(len(msgs) - 1)
+    for i in targets:
+        _mark(msgs[i])
+    return msgs
 
 
 def convert_messages(system: str, messages: list[dict]) -> list[dict]:
@@ -67,8 +116,10 @@ def parse_usage(u: dict) -> Usage:
         hit = u.get("prompt_cache_hit_tokens", 0)
         return Usage(u.get("prompt_cache_miss_tokens", 0), u.get("completion_tokens", 0), hit, 0)
     prompt = u.get("prompt_tokens", 0)
-    cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
-    return Usage(max(0, prompt - cached), u.get("completion_tokens", 0), cached, 0)
+    details = u.get("prompt_tokens_details") or {}
+    cached = details.get("cached_tokens", 0) or 0
+    written = details.get("cache_write_tokens", 0) or 0   # reported by OpenRouter for Anthropic models
+    return Usage(max(0, prompt - cached - written), u.get("completion_tokens", 0), cached, written)
 
 
 class OpenAIProvider(Provider):
@@ -77,6 +128,7 @@ class OpenAIProvider(Provider):
     def __init__(self, cfg) -> None:
         super().__init__(cfg)
         self._stream_options = True
+        self._cache_mode = "full"   # full -> basic -> off, stepped down if a server rejects the markers
         self._token_param = cfg.max_tokens_param or (
             "max_completion_tokens" if "api.openai.com" in cfg.base_url else "max_tokens"
         )
@@ -88,8 +140,11 @@ class OpenAIProvider(Provider):
         return h
 
     def _payload(self, system, messages, tools, model=None, max_tokens=None) -> dict:
+        msgs = convert_messages(system, messages)
+        if self._cache_mode != "off" and wants_cache_markers(self.cfg, model or self.cfg.model):
+            msgs = add_cache_markers(msgs, self._cache_mode)
         payload: dict = {
-            "model": model or self.cfg.model, "messages": convert_messages(system, messages), "stream": True,
+            "model": model or self.cfg.model, "messages": msgs, "stream": True,
             self._token_param: max_tokens or self.cfg.max_tokens,
         }
         if self._stream_options:
@@ -102,7 +157,7 @@ class OpenAIProvider(Provider):
 
     def _open(self, system, messages, tools, model, max_tokens, on_retry):
         url = self.cfg.base_url.rstrip("/") + "/chat/completions"
-        for _ in range(3):  # at most two capability fallbacks
+        for _ in range(5):  # a few capability fallbacks (stream options, token param name, cache markers)
             try:
                 return open_stream(self.client, url, self._headers(),
                                    self._payload(system, messages, tools, model, max_tokens),
@@ -115,6 +170,9 @@ class OpenAIProvider(Provider):
                     self._token_param = "max_tokens"
                 elif e.status in (400, 422) and "max_tokens" in msg and self._token_param == "max_tokens":
                     self._token_param = "max_completion_tokens"
+                elif (e.status in (400, 422) and self._cache_mode != "off" and wants_cache_markers(self.cfg, model or self.cfg.model)
+                      and ("cache" in msg or "content" in msg)):
+                    self._cache_mode = "basic" if self._cache_mode == "full" else "off"
                 else:
                     raise
         raise ProviderError("Server rejected the request parameters repeatedly.", kind="bad_request")
